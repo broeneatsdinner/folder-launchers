@@ -1,0 +1,6 @@
+apps/
+runner/
+.DS_Store
+
+# Local machine-specific launcher definitions contain private absolute paths.
+launchers.md

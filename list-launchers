@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# --------------------------
+# --    list-launchers    --
+# --------------------------
+
+# description: Show configured folder launchers from launchers.md.
+
+set -euo pipefail
+
+source="${BASH_SOURCE[0]}"
+
+while [[ -L "$source" ]]; do
+	source_dir="$(cd -P "$(dirname "$source")" && pwd)"
+	source="$(readlink "$source")"
+
+	if [[ "$source" != /* ]]; then
+		source="$source_dir/$source"
+	fi
+done
+
+repo_dir="$(cd -P "$(dirname "$source")" && pwd)"
+launchers_file="$repo_dir/launchers.md"
+
+if [[ ! -f "$launchers_file" ]]; then
+	printf 'Missing launchers file: %s\n' "$launchers_file" >&2
+	exit 1
+fi
+
+names=()
+destinations=()
+paths=()
+
+while IFS= read -r line; do
+	[[ "$line" == \|*\| ]] || continue
+	[[ "$line" == *'---'* ]] && continue
+	[[ "$line" == *'Name'*'Path'* ]] && continue
+
+	trimmed="${line#|}"
+	trimmed="${trimmed%|}"
+
+	IFS='|' read -r name path extra <<< "$trimmed"
+
+	if [[ -n "${extra:-}" ]]; then
+		continue
+	fi
+
+	name="$(printf '%s' "$name" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+	path="$(printf '%s' "$path" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+	[[ -n "$name" ]] || continue
+	[[ -n "$path" ]] || continue
+
+	destination="${path##*/}"
+
+	display_path="$path"
+	if [[ "$display_path" == "$HOME" ]]; then
+		display_path="~"
+	elif [[ "$display_path" == "$HOME/"* ]]; then
+		display_path="~/${display_path#"$HOME/"}"
+	fi
+
+	names+=("$name")
+	destinations+=("$destination")
+	paths+=("$display_path")
+done < "$launchers_file"
+
+if (( ${#names[@]} == 0 )); then
+	printf 'No folder launchers found in %s\n' "$launchers_file"
+	exit 0
+fi
+
+terminal_width="${COLUMNS:-}"
+if [[ -z "$terminal_width" ]]; then
+	terminal_width="$(tput cols 2>/dev/null || printf '120')"
+fi
+
+if [[ -z "$terminal_width" || "$terminal_width" -lt 40 ]]; then
+	terminal_width=120
+fi
+
+max_table_width=$((terminal_width - 1))
+
+name_width=4
+destination_width=11
+path_width=4
+
+for name in "${names[@]}"; do
+	if (( ${#name} > name_width )); then
+		name_width=${#name}
+	fi
+done
+
+for destination in "${destinations[@]}"; do
+	if (( ${#destination} > destination_width )); then
+		destination_width=${#destination}
+	fi
+done
+
+for path in "${paths[@]}"; do
+	if (( ${#path} > path_width )); then
+		path_width=${#path}
+	fi
+done
+
+# Table width for three columns:
+# │ name │ destination │ path │
+fixed_width_without_path=$((name_width + destination_width + 10))
+natural_table_width=$((fixed_width_without_path + path_width))
+
+if (( natural_table_width > max_table_width )); then
+	path_width=$((max_table_width - fixed_width_without_path))
+
+	if (( path_width < 12 )); then
+		path_width=12
+	fi
+fi
+
+truncate_to_width() {
+	local value="$1"
+	local width="$2"
+
+	if (( ${#value} <= width )); then
+		printf '%s' "$value"
+		return
+	fi
+
+	if (( width <= 1 )); then
+		printf '…'
+		return
+	fi
+
+	printf '%s…' "${value:0:$((width - 1))}"
+}
+
+repeat_char() {
+	local char="$1"
+	local count="$2"
+	local out=""
+
+	while (( count > 0 )); do
+		out+="$char"
+		((count--))
+	done
+
+	printf '%s' "$out"
+}
+
+print_rule() {
+	local left="$1"
+	local middle="$2"
+	local right="$3"
+
+	printf '%s' "$left"
+	repeat_char '─' $((name_width + 2))
+	printf '%s' "$middle"
+	repeat_char '─' $((destination_width + 2))
+	printf '%s' "$middle"
+	repeat_char '─' $((path_width + 2))
+	printf '%s\n' "$right"
+}
+
+print_row() {
+	local name="$1"
+	local destination="$2"
+	local path="$3"
+
+	name="$(truncate_to_width "$name" "$name_width")"
+	destination="$(truncate_to_width "$destination" "$destination_width")"
+	path="$(truncate_to_width "$path" "$path_width")"
+
+	printf '│ %-*s │ %-*s │ %-*s │\n' "$name_width" "$name" "$destination_width" "$destination" "$path_width" "$path"
+}
+
+intro_text=$'
+Spotlight launcher names are case-insensitive.
+
+To use, type Command+Space to open Spotlight, then type the Name from the below table.
+'
+
+# Strip actual leading newlines
+while [[ "$intro_text" == $'\n'* ]]; do
+	intro_text="${intro_text#$'\n'}"
+done
+
+# Strip actual trailing newlines
+while [[ "$intro_text" == *$'\n' ]]; do
+	intro_text="${intro_text%$'\n'}"
+done
+
+printf '\n'
+printf '%s' "$intro_text"
+printf '\n\n'
+
+print_rule '┌' '┬' '┐'
+print_row "Name" "Destination" "Path"
+print_rule '├' '┼' '┤'
+
+for i in "${!names[@]}"; do
+	print_row "${names[$i]}" "${destinations[$i]}" "${paths[$i]}"
+done
+
+print_rule '└' '┴' '┘'

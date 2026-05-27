@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+launchers_file="$repo_dir/launchers.md"
+apps_dir="$repo_dir/apps"
+runner_dir="$repo_dir/runner"
+runner_app="$runner_dir/Folder Launcher Runner.app"
+assigned_icons_dir="$repo_dir/assets/icons/assigned"
+
+mkdir -p "$apps_dir"
+mkdir -p "$runner_dir"
+
+shell_quote() {
+	local value="$1"
+
+	printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+xml_escape() {
+	local value="$1"
+
+	value="${value//&/&amp;}"
+	value="${value//</&lt;}"
+	value="${value//>/&gt;}"
+	value="${value//\"/&quot;}"
+	value="${value//\'/&apos;}"
+
+	printf '%s' "$value"
+}
+
+bundle_identifier_part() {
+	local value="$1"
+
+	value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//')"
+
+	if [[ -z "$value" ]]; then
+		value="launcher"
+	fi
+
+	printf '%s' "$value"
+}
+
+assigned_icon_for_launcher() {
+	local launcher_name="$1"
+	local icon_path
+	local icon_filename
+	local icon_basename
+	local matches=()
+
+	if [[ -d "$assigned_icons_dir" ]]; then
+		shopt -s nullglob
+		for icon_path in "$assigned_icons_dir"/*.icns; do
+			icon_filename="${icon_path##*/}"
+			icon_basename="${icon_filename%.icns}"
+
+			if [[ "$icon_basename" == "$launcher_name" || "$icon_basename" == "$launcher_name "* ]]; then
+				matches+=("$icon_path")
+			fi
+		done
+		shopt -u nullglob
+	fi
+
+	if (( ${#matches[@]} > 1 )); then
+		printf 'Multiple assigned icons match launcher "%s":\n' "$launcher_name" >&2
+		printf '  %s\n' "${matches[@]}" >&2
+		exit 1
+	fi
+
+	if (( ${#matches[@]} == 1 )); then
+		printf '%s' "${matches[0]}"
+	fi
+}
+
+rm -rf "$runner_app"
+mkdir -p "$runner_app/Contents/MacOS"
+
+cat > "$runner_app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>runner</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.example.folder-launchers.runner</string>
+	<key>CFBundleName</key>
+	<string>Folder Launcher Runner</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+</dict>
+</plist>
+PLIST
+
+cat > "$runner_app/Contents/MacOS/runner" <<'RUNNER'
+#!/bin/bash
+set -euo pipefail
+
+if [[ "$#" -ne 1 ]]; then
+	printf 'Expected exactly one target folder path.\n' >&2
+	exit 64
+fi
+
+target_path="$1"
+
+/usr/bin/osascript - "$target_path" <<'APPLESCRIPT'
+on run argv
+	set target_path to item 1 of argv
+	set target_folder to POSIX file target_path as alias
+
+	tell application "Finder"
+		activate
+
+		if (count of windows) is 0 then
+			open target_folder
+		else
+			tell application "System Events"
+				tell process "Finder"
+					keystroke "t" using command down
+				end tell
+			end tell
+
+			delay 0.2
+
+			set target of front window to target_folder
+		end if
+
+		delay 0.1
+
+		tell application "System Events"
+			tell process "Finder"
+				keystroke "2" using command down
+			end tell
+		end tell
+	end tell
+end run
+APPLESCRIPT
+RUNNER
+
+chmod +x "$runner_app/Contents/MacOS/runner"
+
+printf 'Created runner: %s\n' "$runner_app"
+
+while IFS= read -r line; do
+	[[ "$line" == \|*\| ]] || continue
+	[[ "$line" == *'---'* ]] && continue
+	[[ "$line" == *'Name'*'Path'* ]] && continue
+
+	trimmed="${line#|}"
+	trimmed="${trimmed%|}"
+
+	IFS='|' read -r name path extra <<< "$trimmed"
+
+	if [[ -n "${extra:-}" ]]; then
+		printf 'Skipping malformed row: %s\n' "$line" >&2
+		continue
+	fi
+
+	name="$(printf '%s' "$name" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+	path="$(printf '%s' "$path" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+	if [[ -z "$name" || -z "$path" ]]; then
+		printf 'Skipping row with blank name or path: %s\n' "$line" >&2
+		continue
+	fi
+
+	if [[ "$path" != /* ]]; then
+		printf 'Skipping non-absolute path for %s: %s\n' "$name" "$path" >&2
+		continue
+	fi
+
+	if [[ ! -d "$path" ]]; then
+		printf 'Warning: path does not currently exist for %s: %s\n' "$name" "$path" >&2
+	fi
+
+	app_path="$apps_dir/$name.app"
+	bundle_name="$(xml_escape "$name")"
+	bundle_identifier="com.example.folder-launchers.$(bundle_identifier_part "$name")"
+	quoted_runner_app="$(shell_quote "$runner_app")"
+	quoted_path="$(shell_quote "$path")"
+	assigned_icon="$(assigned_icon_for_launcher "$name")"
+
+	if [[ -n "$assigned_icon" ]]; then
+		icon_plist_entry=$'\t<key>CFBundleIconFile</key>\n\t<string>app.icns</string>'
+	else
+		icon_plist_entry=""
+	fi
+
+	rm -rf "$app_path"
+	mkdir -p "$app_path/Contents/MacOS"
+
+	if [[ -n "$assigned_icon" ]]; then
+		mkdir -p "$app_path/Contents/Resources"
+		cp "$assigned_icon" "$app_path/Contents/Resources/app.icns"
+	fi
+
+	cat > "$app_path/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>launcher</string>
+	<key>CFBundleIdentifier</key>
+	<string>$bundle_identifier</string>
+	<key>CFBundleName</key>
+	<string>$bundle_name</string>
+$icon_plist_entry
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+</dict>
+</plist>
+PLIST
+
+	cat > "$app_path/Contents/MacOS/launcher" <<LAUNCHER
+#!/bin/bash
+set -euo pipefail
+
+/usr/bin/open -n -a $quoted_runner_app --args $quoted_path
+LAUNCHER
+
+	chmod +x "$app_path/Contents/MacOS/launcher"
+
+	printf 'Created: %s\n' "$app_path"
+done < "$launchers_file"

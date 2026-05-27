@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# ---------------------
+# --    buildicon    --
+# ---------------------
+# description: Build a macOS .icns file from a rendered PNG, .icon package, or existing .icns file.
+#
+# This file is meant to be run directly from the folder-launchers icon assets
+# directory. It converts rendered PNG files, usually exported from Icon Composer,
+# into multi-size macOS .icns files.
+#
+# When given an Icon Composer .icon package, it uses the sibling rendered PNG
+# when that PNG already exists. If the rendered PNG does not exist, it runs the
+# local exporticon helper in PNG-only mode to drive Icon Composer through
+# Keyboard Maestro.
+#
+# Usage:
+#	./buildicon input.png [output.icns]
+#	./buildicon input.icon [output.icns]
+#	./buildicon input.icns [output.png]
+#	./buildicon input-name-without-extension
+#
+# Examples:
+#	./buildicon "Computer Network Liquid Glass-iOS-Default-1024x1024@1x.png"
+#	./buildicon "Computer Network Liquid Glass.icon"
+#	./buildicon "Computer RGB Green Liquid Glass.icns"
+#	./buildicon "Computer RGB Green Liquid Glass"
+#
+# Notes:
+#	If output.icns is omitted for PNG or .icon input, buildicon derives the
+#	output name from the input filename. For Icon Composer PNG exports, suffixes
+#	like "-iOS-Default-1024x1024@1x.png" are removed.
+#
+#	If output.png is omitted for ICNS input, buildicon derives the output name
+#	from the ICNS filename.
+set -euo pipefail
+
+icons_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+work_dir=""
+
+# Print command usage.
+usage() {
+	cat <<'USAGE'
+Usage:
+	./buildicon input.png [output.icns]
+	./buildicon input.icon [output.icns]
+	./buildicon input.icns [output.png]
+	./buildicon input-name-without-extension
+
+Examples:
+	./buildicon "Computer Network Liquid Glass-iOS-Default-1024x1024@1x.png"
+	./buildicon "Computer Network Liquid Glass.icon"
+	./buildicon "Computer RGB Green Liquid Glass.icns"
+	./buildicon "Computer RGB Green Liquid Glass"
+
+Notes:
+	If output.icns is omitted for PNG or .icon input, buildicon derives the output name from the input filename.
+	For Icon Composer PNG exports, suffixes like "-iOS-Default-1024x1024@1x.png" are removed.
+	If output.png is omitted for ICNS input, buildicon derives the output name from the ICNS filename.
+USAGE
+}
+
+# Print a blank line.
+blank_line() {
+	printf '\n'
+}
+
+# Print a label followed by an indented value.
+print_field() {
+	local label="$1"
+	local value="$2"
+
+	printf '%s:\n' "$label"
+	printf '\t%s\n' "$value"
+}
+
+# Print a label followed by an indented value after a blank line.
+print_block_field() {
+	local label="$1"
+	local value="$2"
+
+	blank_line
+	print_field "$label" "$value"
+}
+
+# Print file(1) output as a readable block.
+print_file_info() {
+	local target="$1"
+	local file_output
+	local description
+
+	file_output="$(file "$target")"
+	description="${file_output#"$target: "}"
+
+	blank_line
+	printf '%s:\n' "$target"
+	printf '\t%s\n' "$description"
+}
+
+# Print output file information as part of an output block.
+print_output_file_info() {
+	local target="$1"
+	local file_output
+	local description
+
+	file_output="$(file "$target")"
+	description="${file_output#"$target: "}"
+
+	printf '\t%s:\n' "$target"
+	printf '\t\t%s\n' "$description"
+}
+
+# Remove the temporary working directory if it was created.
+clean_work_dir() {
+	if [[ -n "$work_dir" ]]; then
+		rm -rf "$work_dir"
+	fi
+}
+
+# Print a usage error, show help, and exit with a usage status.
+usage_error() {
+	printf '%s\n' "$*" >&2
+	usage >&2
+	exit 64
+}
+
+# Verify that a required external command exists before continuing.
+require_command() {
+	local command_name="$1"
+
+	if ! command -v "$command_name" >/dev/null 2>&1; then
+		printf 'Required command not found: %s\n' "$command_name" >&2
+		exit 69
+	fi
+}
+
+# Resolve a source path, including bare filenames without .png, .icon, or .icns.
+resolve_source_path() {
+	local value="$1"
+	local candidate
+
+	if [[ "$value" == /* ]]; then
+		if [[ -e "$value" ]]; then
+			printf '%s\n' "$value"
+			return
+		fi
+
+		if [[ -f "$value.png" ]]; then
+			printf '%s\n' "$value.png"
+			return
+		fi
+
+		if [[ -d "$value.icon" ]]; then
+			printf '%s\n' "$value.icon"
+			return
+		fi
+
+		if [[ -f "$value.icns" ]]; then
+			printf '%s\n' "$value.icns"
+			return
+		fi
+	else
+		candidate="$icons_dir/$value"
+
+		if [[ -e "$candidate" ]]; then
+			printf '%s\n' "$candidate"
+			return
+		fi
+
+		if [[ -f "$candidate.png" ]]; then
+			printf '%s\n' "$candidate.png"
+			return
+		fi
+
+		if [[ -d "$candidate.icon" ]]; then
+			printf '%s\n' "$candidate.icon"
+			return
+		fi
+
+		if [[ -f "$candidate.icns" ]]; then
+			printf '%s\n' "$candidate.icns"
+			return
+		fi
+	fi
+
+	printf 'Source file does not exist: %s\n' "$value" >&2
+	exit 66
+}
+
+# Derive a clean .icns output filename from a source PNG or .icon path.
+derive_icns_output_name() {
+	local source_path="$1"
+	local source_filename
+	local base
+
+	source_filename="${source_path##*/}"
+	base="${source_filename%.*}"
+
+	base="${base%-iOS-Default-1024x1024@1x}"
+	base="${base%-macOS-Default-1024x1024@1x}"
+	base="${base%-watchOS-Default-1024x1024@1x}"
+
+	printf '%s.icns' "$base"
+}
+
+# Derive a clean .png output filename from a source ICNS path.
+derive_png_output_name() {
+	local source_path="$1"
+	local source_filename
+	local base
+
+	source_filename="${source_path##*/}"
+	base="${source_filename%.*}"
+
+	printf '%s.png' "$base"
+}
+
+# Resolve a relative output path against the icon assets directory.
+resolve_output_path() {
+	local value="$1"
+
+	if [[ "$value" == /* ]]; then
+		printf '%s\n' "$value"
+	else
+		printf '%s/%s\n' "$icons_dir" "$value"
+	fi
+}
+
+# Return the expected rendered PNG path for an Icon Composer .icon package.
+rendered_png_for_icon_package() {
+	local icon_package="$1"
+
+	printf '%s.png' "${icon_package%.*}"
+}
+
+# Ensure the rendered PNG exists for an Icon Composer .icon package.
+ensure_rendered_png_for_icon_package() {
+	local icon_package="$1"
+	local rendered_png
+
+	rendered_png="$(rendered_png_for_icon_package "$icon_package")"
+
+	if [[ -f "$rendered_png" ]]; then
+		printf '%s\n' "$rendered_png"
+		return
+	fi
+
+	if [[ ! -x "$icons_dir/exporticon" ]]; then
+		printf 'Rendered PNG does not exist and exporticon is missing or not executable: %s\n' "$icons_dir/exporticon" >&2
+		exit 66
+	fi
+
+	{
+		blank_line
+		printf 'Rendered PNG missing; running exporticon --png-only for:\n'
+		printf '\t%s\n' "$icon_package"
+	} >&2
+
+	"$icons_dir/exporticon" --png-only "$icon_package" >&2
+
+	if [[ ! -f "$rendered_png" ]]; then
+		printf 'Rendered PNG was not created: %s\n' "$rendered_png" >&2
+		exit 1
+	fi
+
+	printf '%s\n' "$rendered_png"
+}
+
+# Generate one resized PNG inside the temporary iconset directory.
+build_iconset_image() {
+	local source_png="$1"
+	local width="$2"
+	local height="$3"
+	local target="$4"
+
+	sips -z "$height" "$width" "$source_png" --out "$target" >/dev/null
+}
+
+# Build a multi-size .icns file from a source PNG.
+build_icns_from_png() {
+	local source_png="$1"
+	local output_icns="$2"
+	local iconset
+
+	case "$output_icns" in
+		*.icns|*.ICNS)
+			;;
+		*)
+			printf 'Output file must end in .icns: %s\n' "$output_icns" >&2
+			exit 65
+			;;
+	esac
+
+	iconset="$work_dir/build.iconset"
+	mkdir -p "$iconset"
+
+	print_block_field "Building icon from" "$source_png"
+	print_block_field "Output" "$output_icns"
+
+	build_iconset_image "$source_png" 16 16     "$iconset/icon_16x16.png"
+	build_iconset_image "$source_png" 32 32     "$iconset/icon_16x16@2x.png"
+	build_iconset_image "$source_png" 32 32     "$iconset/icon_32x32.png"
+	build_iconset_image "$source_png" 64 64     "$iconset/icon_32x32@2x.png"
+	build_iconset_image "$source_png" 128 128   "$iconset/icon_128x128.png"
+	build_iconset_image "$source_png" 256 256   "$iconset/icon_128x128@2x.png"
+	build_iconset_image "$source_png" 256 256   "$iconset/icon_256x256.png"
+	build_iconset_image "$source_png" 512 512   "$iconset/icon_256x256@2x.png"
+	build_iconset_image "$source_png" 512 512   "$iconset/icon_512x512.png"
+
+	cp "$source_png" "$iconset/icon_512x512@2x.png"
+
+	iconutil -c icns "$iconset" -o "$output_icns"
+
+	print_output_file_info "$output_icns"
+}
+
+# Print the best available PNG path from an extracted iconset.
+best_iconset_png() {
+	local iconset="$1"
+	local candidate
+
+	for candidate in \
+		"$iconset/icon_512x512@2x.png" \
+		"$iconset/icon_512x512.png" \
+		"$iconset/icon_256x256@2x.png" \
+		"$iconset/icon_256x256.png" \
+		"$iconset/icon_128x128@2x.png" \
+		"$iconset/icon_128x128.png" \
+		"$iconset/icon_32x32@2x.png" \
+		"$iconset/icon_32x32.png" \
+		"$iconset/icon_16x16@2x.png" \
+		"$iconset/icon_16x16.png"
+	do
+		if [[ -f "$candidate" ]]; then
+			printf '%s\n' "$candidate"
+			return
+		fi
+	done
+
+	printf 'No PNG representations found in extracted iconset.\n' >&2
+	exit 65
+}
+
+# Extract the largest available PNG representation from an existing .icns file.
+extract_png_from_icns() {
+	local source_icns="$1"
+	local output_png="$2"
+	local iconset
+	local best_png
+
+	case "$output_png" in
+		*.png|*.PNG)
+			;;
+		*)
+			printf 'Output file must end in .png: %s\n' "$output_png" >&2
+			exit 65
+			;;
+	esac
+
+	iconset="$work_dir/extracted.iconset"
+	iconutil -c iconset "$source_icns" -o "$iconset"
+
+	best_png="$(best_iconset_png "$iconset")"
+
+	print_block_field "Extracting PNG from" "$source_icns"
+	print_block_field "Output" "$output_png"
+	print_block_field "Source image" "${best_png##*/}"
+
+	cp "$best_png" "$output_png"
+
+	print_file_info "$output_png"
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
+	usage_error "Expected one input path and an optional output path."
+fi
+
+require_command sips
+require_command iconutil
+require_command file
+require_command mktemp
+
+trap clean_work_dir EXIT
+
+src="$(resolve_source_path "$1")"
+out="${2:-}"
+work_dir="$(mktemp -d "$icons_dir/.buildicon.XXXXXX")"
+
+case "$src" in
+	*.png|*.PNG)
+		if [[ -z "$out" ]]; then
+			out="$(derive_icns_output_name "$src")"
+		fi
+
+		out="$(resolve_output_path "$out")"
+
+		build_icns_from_png "$src" "$out"
+		;;
+	*.icon|*.ICON)
+		if [[ ! -d "$src" ]]; then
+			printf 'Icon Composer input must be a .icon directory: %s\n' "$src" >&2
+			exit 65
+		fi
+
+		source_png="$(ensure_rendered_png_for_icon_package "$src")"
+
+		if [[ -z "$out" ]]; then
+			out="$(derive_icns_output_name "$src")"
+		fi
+
+		out="$(resolve_output_path "$out")"
+
+		build_icns_from_png "$source_png" "$out"
+		;;
+	*.icns|*.ICNS)
+		if [[ -z "$out" ]]; then
+			out="$(derive_png_output_name "$src")"
+		fi
+
+		out="$(resolve_output_path "$out")"
+
+		extract_png_from_icns "$src" "$out"
+		;;
+	*)
+		printf 'Source file must be a PNG, ICNS, or .icon package: %s\n' "$src" >&2
+		exit 65
+		;;
+esac

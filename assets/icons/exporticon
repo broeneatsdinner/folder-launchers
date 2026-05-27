@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# ----------------------
+# --    exporticon    --
+# ----------------------
+# description: Export a rendered PNG from an Icon Composer .icon package.
+#
+# This file is meant to be run directly from the folder-launchers icon assets
+# directory. It uses Keyboard Maestro to drive Icon Composer's rendered PNG
+# export.
+#
+# By default, exporticon runs buildicon after the rendered PNG is created. In
+# --png-only mode, it exports the rendered PNG and exits without building the
+# final .icns file.
+#
+# The Keyboard Maestro macro must be named:
+#
+#	Export Icon Composer Rendered PNG
+#
+# The macro must use these Keyboard Maestro variables:
+#
+#	IconPath
+#	IconPathPNG
+#
+# Usage:
+#	./exporticon input.icon
+#	./exporticon --png-only input.icon
+#	./exporticon input-name-without-extension
+#
+# Examples:
+#	./exporticon "Computer RGB Green Liquid Glass.icon"
+#	./exporticon --png-only "Computer RGB Green Liquid Glass.icon"
+#	./exporticon "Computer RGB Green Liquid Glass"
+set -euo pipefail
+
+icons_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+macro_name="Export Icon Composer Rendered PNG"
+png_only=false
+
+# Print command usage.
+usage() {
+	cat <<'USAGE'
+Usage:
+	./exporticon input.icon
+	./exporticon --png-only input.icon
+	./exporticon input-name-without-extension
+
+Examples:
+	./exporticon "Computer RGB Green Liquid Glass.icon"
+	./exporticon --png-only "Computer RGB Green Liquid Glass.icon"
+	./exporticon "Computer RGB Green Liquid Glass"
+
+Notes:
+	exporticon removes the expected PNG output before running the Keyboard
+	Maestro macro so Icon Composer does not show an overwrite dialog.
+
+	In --png-only mode, exporticon creates the rendered PNG only and does not
+	call buildicon afterward.
+USAGE
+}
+
+# Print a blank line.
+blank_line() {
+	printf '\n'
+}
+
+# Print a label followed by an indented value.
+print_field() {
+	local label="$1"
+	local value="$2"
+
+	printf '%s:\n' "$label"
+	printf '\t%s\n' "$value"
+}
+
+# Print file(1) output as a readable block.
+print_file_info() {
+	local target="$1"
+	local file_output
+	local description
+
+	file_output="$(file "$target")"
+	description="${file_output#"$target: "}"
+
+	blank_line
+	printf '%s:\n' "$target"
+	printf '\t%s\n' "$description"
+}
+
+# Print an error message with usage and exit.
+usage_error() {
+	printf '%s\n' "$*" >&2
+	usage >&2
+	exit 64
+}
+
+# Verify that a required external command exists before continuing.
+require_command() {
+	local command_name="$1"
+
+	if ! command -v "$command_name" >/dev/null 2>&1; then
+		printf 'Required command not found: %s\n' "$command_name" >&2
+		exit 69
+	fi
+}
+
+# Resolve an input value to an Icon Composer .icon package directory.
+resolve_icon_path() {
+	local value="$1"
+	local candidate
+
+	if [[ "$value" == /* ]]; then
+		if [[ -d "$value" ]]; then
+			printf '%s\n' "$value"
+			return
+		fi
+
+		if [[ -d "$value.icon" ]]; then
+			printf '%s\n' "$value.icon"
+			return
+		fi
+	else
+		candidate="$icons_dir/$value"
+
+		if [[ -d "$candidate" ]]; then
+			printf '%s\n' "$candidate"
+			return
+		fi
+
+		if [[ -d "$candidate.icon" ]]; then
+			printf '%s\n' "$candidate.icon"
+			return
+		fi
+	fi
+
+	printf 'Icon Composer package does not exist: %s\n' "$value" >&2
+	exit 66
+}
+
+# Escape a string for safe inclusion in AppleScript string literals.
+applescript_escape() {
+	local value="$1"
+
+	value="${value//\\/\\\\}"
+	value="${value//\"/\\\"}"
+
+	printf '%s' "$value"
+}
+
+# Verify that Keyboard Maestro Engine is installed and scriptable.
+require_keyboard_maestro() {
+	if ! osascript -e 'tell application "Keyboard Maestro Engine" to get name' >/dev/null 2>&1; then
+		printf 'Keyboard Maestro Engine is not available.\n' >&2
+		printf 'Cannot export rendered Icon Composer PNG files without Keyboard Maestro.\n' >&2
+		exit 69
+	fi
+}
+
+# Verify that the required Keyboard Maestro macro exists before export.
+require_keyboard_maestro_macro() {
+	local macros_file
+
+	macros_file="$HOME/Library/Application Support/Keyboard Maestro/Keyboard Maestro Macros.plist"
+
+	if [[ ! -f "$macros_file" ]]; then
+		printf 'Keyboard Maestro macro library was not found:\n' >&2
+		printf '\t%s\n' "$macros_file" >&2
+		exit 69
+	fi
+
+	if ! plutil -convert xml1 -o - "$macros_file" \
+		| grep -F -q "<string>$macro_name</string>"
+	then
+		printf 'Required Keyboard Maestro macro was not found:\n' >&2
+		printf '\t%s\n' "$macro_name" >&2
+		printf '\n' >&2
+		printf 'Create or import this macro before exporting .icon packages.\n' >&2
+		exit 69
+	fi
+}
+
+# Trigger the Keyboard Maestro macro that performs the Icon Composer export.
+run_export_macro() {
+	local icon_path="$1"
+	local png_path="$2"
+	local escaped_icon_path
+	local escaped_png_path
+	local escaped_macro_name
+
+	escaped_icon_path="$(applescript_escape "$icon_path")"
+	escaped_png_path="$(applescript_escape "$png_path")"
+	escaped_macro_name="$(applescript_escape "$macro_name")"
+
+	osascript >/dev/null <<APPLESCRIPT
+tell application "Keyboard Maestro Engine"
+	setvariable "IconPath" to "$escaped_icon_path"
+	setvariable "IconPathPNG" to "$escaped_png_path"
+	do script "$escaped_macro_name"
+end tell
+APPLESCRIPT
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+while [[ "$#" -gt 0 ]]; do
+	case "$1" in
+		--png-only)
+			png_only=true
+			;;
+		-*)
+			usage_error "Unknown option: $1"
+			;;
+		*)
+			if [[ -n "${input_value:-}" ]]; then
+				usage_error "Expected exactly one .icon package path or basename."
+			fi
+
+			input_value="$1"
+			;;
+	esac
+
+	shift
+done
+
+if [[ -z "${input_value:-}" ]]; then
+	usage_error "Expected exactly one .icon package path or basename."
+fi
+
+require_command osascript
+require_command file
+require_command plutil
+require_command grep
+require_keyboard_maestro
+require_keyboard_maestro_macro
+
+icon_path="$(resolve_icon_path "$input_value")"
+
+case "$icon_path" in
+	*.icon|*.ICON)
+		;;
+	*)
+		printf 'Input must be an Icon Composer .icon package: %s\n' "$icon_path" >&2
+		exit 65
+		;;
+esac
+
+if ! "$png_only" && [[ ! -x "$icons_dir/buildicon" ]]; then
+	printf 'Required helper is missing or not executable: %s\n' "$icons_dir/buildicon" >&2
+	exit 66
+fi
+
+png_path="${icon_path%.*}.png"
+icns_path="${icon_path%.*}.icns"
+
+blank_line
+print_field "Icon package" "$icon_path"
+print_field "PNG output" "$png_path"
+
+if ! "$png_only"; then
+	print_field "ICNS output" "$icns_path"
+fi
+
+# Remove the expected PNG first so Icon Composer does not show an overwrite
+# confirmation dialog during the Keyboard Maestro export.
+rm -f "$png_path"
+
+run_export_macro "$icon_path" "$png_path"
+
+if [[ ! -f "$png_path" ]]; then
+	printf 'Rendered PNG was not created: %s\n' "$png_path" >&2
+	exit 1
+fi
+
+if "$png_only"; then
+	print_file_info "$png_path"
+	exit 0
+fi
+
+"$icons_dir/buildicon" "$png_path" "$icns_path"
