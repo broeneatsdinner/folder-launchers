@@ -4,3 +4,4 @@ runner/
 
 # Local machine-specific launcher definitions contain private absolute paths.
 launchers.md
+.aider*
