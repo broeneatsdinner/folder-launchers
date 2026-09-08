@@ -30,7 +30,7 @@ names=()
 destinations=()
 paths=()
 
-while IFS= read -r line; do
+while IFS= read -r line || [[ -n "$line" ]]; do
 	[[ "$line" == \|*\| ]] || continue
 	[[ "$line" == *'---'* ]] && continue
 	[[ "$line" == *'Name'*'Path'* ]] && continue
